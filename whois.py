@@ -30,6 +30,7 @@ def get_whois_data(query,dst):
                     continue
                 else:
                     data+=buf
+    sd.close()
     return data 
             
 
