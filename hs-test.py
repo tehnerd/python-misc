@@ -2,10 +2,12 @@ import sys
 import os
 import struct
 from string import join
-import BaseHTTPServer
-import urlparse
+import select
+import socket
+import re
 
 METAHDRSIZE=24
+SBUFFSIZE = 4096
 
 class MetaInfo(object):
     @staticmethod
@@ -25,7 +27,7 @@ class MetaInfo(object):
     def parse_meta(fd_hs,size,meta_dict):
         fd_hs.seek(0)
         while fd_hs.tell() < size:
-            meta_packed = fd_hs.read(24)
+            meta_packed = fd_hs.read(METAHDRSIZE)
             meta = struct.unpack('!QQQ',meta_packed)
             print(meta)
             fname = fd_hs.read(meta[2])
@@ -33,35 +35,38 @@ class MetaInfo(object):
             fd_hs.seek(meta[1],os.SEEK_CUR)
 
 
-class RequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-    def do_GET(self):
-        parsed_path = urlparse.urlparse(self.path)
-        params = urlparse.parse_qs(parsed_path.query)
-        try:
-            requested_pic = params.get('file')[0]
-        except:
-            return
-        fname_hs = sys.argv[2]
-        fd_hs = open(fname_hs,"r")
-        hs_size = os.stat(fname_hs).st_size
-        meta_dict = dict()
-        MetaInfo.parse_meta(fd_hs,hs_size,meta_dict)
-        if requested_pic in meta_dict:
-            response_code = 200
-            self.send_response(response_code)
-            meta = meta_dict[requested_pic]
-            fd_hs.seek(meta[0]+METAHDRSIZE+meta[2])
-            message = fd_hs.read(meta[1])
-            self.end_headers()
-            self.wfile.write(message)
-            fd_hs.close()
-        else:
-            fd_hs.close()
-            response_code = 400
-            self.send_response(response_code)
-            self.end_headers()
-        return
+class HSTestHandler(object):
+    
+    def __init__(self,meta_dict,hs_descriptor):
+        self.meta_dict = meta_dict
+        self.hs_descriptor = hs_descriptor
 
+    def GetHSData(self, msg):
+        reply = str()
+        for line in msg.split('\n'):
+            if re.match("GET (.+)? .*?",line):
+                path = re.findall("GET (.+)? .*?",line)[0]
+                if path == "/":
+                    reply = "HTTP/1.1 200 OK\n\n"
+                    for key in self.meta_dict:
+                        reply = join((reply,key,'\n'),'')
+                    reply = join((reply,'\r\n'),'')
+                elif re.search("file=",path):
+                    path = path.split("file=")
+                    fname = path[1]
+                    if fname in self.meta_dict:
+                        reply = "HTTP/1.1 200 OK\n\n"
+                        meta = self.meta_dict[fname]
+                        self.hs_descriptor.seek(meta[0]+METAHDRSIZE+meta[2])
+                        data = self.hs_descriptor.read(meta[1])
+                        reply = join((reply,data,'\r\n'),'')
+                    else:
+                        reply = "HTTP/1.1 404 NotFound\n\r\n"
+                else:
+                    reply = "HTTP/1.1 404 NotFound\n\r\n"
+                break
+        return reply
+    
         
 
         
@@ -82,11 +87,58 @@ def add_file(fname_source, fname_hs):
     fd_source.close()
     fd_dst.close()
 
-def run_server(server_class=BaseHTTPServer.HTTPServer,
-        handler_class=RequestHandler):
-    server_address = ('', 8000)
-    httpd = server_class(server_address, handler_class)
-    httpd.serve_forever()
+
+def unregister_sock(sock,poller,sd_dict,msg_dict):
+    poller.unregister(sock)
+    del sd_dict[sock.fileno()]
+    del msg_dict[sock.fileno()]
+    sock.close()
+    return True
+
+def run_async_server():
+    fname_hs = sys.argv[2]
+    fd_hs = open(fname_hs,"rb")
+    hs_size = os.stat(fname_hs).st_size
+    meta_dict = dict()
+    MetaInfo.parse_meta(fd_hs,hs_size,meta_dict)
+    poller = select.epoll()
+    ro = select.EPOLLIN | select.EPOLLERR | select.EPOLLPRI | select.EPOLLHUP
+    rw = ro | select.EPOLLOUT
+    serv_sd = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    serv_sd.bind(('',8000))
+    serv_sd.setblocking(0)
+    sd_dict = dict()
+    msg_dict = dict()
+    sd_dict[serv_sd.fileno()] = serv_sd
+    poller.register(serv_sd,ro)
+    serv_sd.listen(1000)
+    HS = HSTestHandler(meta_dict, fd_hs)
+    while True:
+        events = poller.poll()
+        for fd,flag in events:
+            if flag&select.EPOLLIN:
+                sock = sd_dict[fd]
+                if sock == serv_sd:
+                    client,radr = sock.accept()
+                    client.setblocking(0)
+                    sd_dict[client.fileno()] = client
+                    msg_dict[client.fileno()] = str()
+                    poller.register(client,ro)
+                else:
+                    data = sock.recv(SBUFFSIZE)
+                    if not data:
+                        unregister_sock(sock,poller,sd_dict,msg_dict)
+                        continue
+                    msg_dict[sock.fileno()]+=data
+                    if msg_dict[sock.fileno()][-2:] == '\r\n':
+                        msg_dict[sock.fileno()]=HS.GetHSData(msg_dict[sock.fileno()])
+                        poller.modify(sock,rw)
+            if flag&select.EPOLLOUT:
+                sock = sd_dict[fd]
+                sock.send(msg_dict[sock.fileno()])
+                unregister_sock(sock,poller,sd_dict,msg_dict)
+
+    
 
 
 def main():
@@ -95,7 +147,7 @@ def main():
         fname_hs = sys.argv[3]
         add_file(fname_source,fname_hs)
     if sys.argv[1] == "start":
-        run_server()
+        run_async_server()
 
 
 if __name__ == "__main__":
