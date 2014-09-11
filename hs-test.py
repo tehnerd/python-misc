@@ -56,6 +56,8 @@ class HSTestHandler(object):
                     fname = path[1]
                     if fname in self.meta_dict:
                         reply = "HTTP/1.1 200 OK\n\n"
+                        if re.match(".*?\.jpg",fname):
+                            reply = join((reply[:-1],"Content-Type:image/jpeg\n\n"),'')
                         meta = self.meta_dict[fname]
                         self.hs_descriptor.seek(meta[0]+METAHDRSIZE+meta[2])
                         data = self.hs_descriptor.read(meta[1])
